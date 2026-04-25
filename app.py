@@ -3,238 +3,353 @@ app.py
 ======
 NYAYA-SETU — Streamlit Frontend (Databricks Apps)
 
-Databricks Apps runs this file directly.
-All heavy artifacts (FAISS index, metadata, BNS CSV) must already exist
-in DBFS before launching the app. Run the 4 pipeline scripts first.
+TWO modes — the app auto-detects which to use:
 
-Environment variables expected (set in app.yaml or Databricks App config):
-  GROQ_API_KEY   — your Groq API key
-  OUT_DIR        — DBFS path where pipeline outputs live
-                   (default: /dbfs/FileStore/nyaya_setu/output)
+  MODE A  (files already in DBFS / env vars point to existing files)
+          ── Just open the app and query. Pipeline loads in ~90s on CPU.
+
+  MODE B  (files NOT yet on DBFS — first-time Databricks setup)
+          ── Use the "Upload Files" tab to drop your 3 pre-built files.
+          ── The app saves them to DBFS and then switches to Mode A.
+
+Environment variables (set in Databricks App config or app.yaml):
+  GROQ_API_KEY  — Groq API key (can also be entered in the sidebar)
+  OUT_DIR       — where to write / read artifacts on DBFS
+                  default: /dbfs/FileStore/nyaya_setu/output
 """
+
+from __future__ import annotations
 
 import os
 import sys
+import re
+import tempfile
+import shutil
 import streamlit as st
 
-# ── PAGE CONFIG (must be first Streamlit call) ────────────────────────────────
+# ── PAGE CONFIG (must be the very first Streamlit call) ───────────────────────
 st.set_page_config(
-    page_title = "Nyaya-Setu ⚖️",
-    page_icon  = "⚖️",
-    layout     = "wide",
+    page_title="Nyaya-Setu ⚖️",
+    page_icon="⚖️",
+    layout="wide",
 )
 
-# ── INJECT scripts/ folder INTO PATH ─────────────────────────────────────────
-APP_DIR  = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS  = os.path.join(APP_DIR, "scripts")
-if SCRIPTS not in sys.path:
-    sys.path.insert(0, SCRIPTS)
+# ── MAKE scripts/ importable ──────────────────────────────────────────────────
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
+# ── PATHS (all overridable via env) ───────────────────────────────────────────
 OUT_DIR          = os.getenv("OUT_DIR",    "/dbfs/FileStore/nyaya_setu/output")
 FAISS_INDEX_PATH = os.getenv("INDEX_PATH", f"{OUT_DIR}/faiss_precedents.index")
 FAISS_META_PATH  = os.getenv("META_PATH",  f"{OUT_DIR}/faiss_metadata.parquet")
 BNS_CSV_PATH     = os.getenv("BNS_CSV",    f"{OUT_DIR}/bns_ipc_mapping.csv")
-GROQ_API_KEY     = os.getenv("GROQ_API_KEY", "")
+
+EXPECTED_FILES = {
+    "FAISS Index (.index)":         FAISS_INDEX_PATH,
+    "Metadata (.parquet)":          FAISS_META_PATH,
+    "BNS-IPC Mapping (.csv)":       BNS_CSV_PATH,
+}
 
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/5/55/Emblem_of_India.svg", width=80)
+    st.image(
+        "https://upload.wikimedia.org/wikipedia/commons/5/55/Emblem_of_India.svg",
+        width=72,
+    )
     st.title("Nyaya-Setu ⚖️")
     st.caption("AI Legal Co-Counsel · BNS / IPC")
     st.divider()
 
+    # Groq key — read from env, allow override in UI
+    _env_key = os.getenv("GROQ_API_KEY", "")
     api_key_input = st.text_input(
         "Groq API Key",
-        value       = GROQ_API_KEY,
-        type        = "password",
-        help        = "Get a free key at console.groq.com",
-        placeholder = "gsk_…",
+        value=_env_key,
+        type="password",
+        help="Free key at console.groq.com",
+        placeholder="gsk_…",
     )
     if api_key_input:
         os.environ["GROQ_API_KEY"] = api_key_input
 
     st.divider()
-    st.markdown("**Data paths**")
-    st.code(f"FAISS : {FAISS_INDEX_PATH}\nMeta  : {FAISS_META_PATH}\nBNS   : {BNS_CSV_PATH}", language="")
+
+    # Live status for each required file
+    st.markdown("**Artifact status**")
+    all_present = True
+    for label, path in EXPECTED_FILES.items():
+        exists = os.path.exists(path)
+        if not exists:
+            all_present = False
+        icon = "✅" if exists else "❌"
+        size = ""
+        if exists:
+            mb = os.path.getsize(path) / 1e6
+            size = f" ({mb:.0f} MB)"
+        st.markdown(f"{icon} {label}{size}")
+
     st.divider()
-    st.markdown(
-        "**How to set up**\n\n"
-        "1. Run `01_chunk_pdfs.py`\n"
-        "2. Run `02_build_faiss.py`\n"
-        "3. Run `03_build_bns_ipc_map.py`\n"
-        "4. Launch this app 🚀"
-    )
+    st.caption("v2.0 · Llama 3.3 70B · MiniLM · CPU-only")
 
 
 # ── HEADER ────────────────────────────────────────────────────────────────────
 st.title("⚖️ Nyaya-Setu — Indian Legal AI Co-Counsel")
 st.markdown(
     "Powered by **Llama 3.3 70B** (Groq) · **MiniLM** embeddings · "
-    "**42k** Supreme Court precedents · **BNS ↔ IPC** mapping"
+    "**42 k** Supreme Court precedents · **BNS ↔ IPC** mapping"
 )
 st.divider()
 
-
-# ── ARTIFACT CHECK ────────────────────────────────────────────────────────────
-def check_artifacts() -> tuple[bool, list]:
-    missing = []
-    for label, path in [
-        ("FAISS Index",  FAISS_INDEX_PATH),
-        ("Metadata",     FAISS_META_PATH),
-        ("BNS-IPC Map",  BNS_CSV_PATH),
-    ]:
-        if not os.path.exists(path):
-            missing.append(f"**{label}** not found at `{path}`")
-    return len(missing) == 0, missing
+# ── TABS ──────────────────────────────────────────────────────────────────────
+tab_query, tab_upload = st.tabs(["⚖️  Query", "📂  Upload Pre-built Files"])
 
 
-artifacts_ok, missing_list = check_artifacts()
-
-if not artifacts_ok:
-    st.error("⚠️  Required data files are missing. Run the pipeline scripts first.")
-    for m in missing_list:
-        st.markdown(f"- {m}")
-    st.stop()
-
-
-# ── LOAD PIPELINE (cached so it only runs once per session) ───────────────────
-@st.cache_resource(show_spinner="Loading AI pipeline — first load ~2 min on CPU…")
-def get_pipeline():
-    if not os.environ.get("GROQ_API_KEY"):
-        return None, "GROQ_API_KEY not set."
-    try:
-        # Import from scripts/
-        from scripts.langchain_pipeline_module import (   # noqa: E402
-            load_pipeline_artifacts, load_embedder, build_chain
-        )
-        faiss_index, df_meta, df_bns = load_pipeline_artifacts()
-        embedder                      = load_embedder()
-        chain                         = build_chain(faiss_index, df_meta, df_bns, embedder)
-        return chain, None
-    except Exception as e:
-        return None, str(e)
-
-
-# Lazy init: only load when user provides a key
-if not os.environ.get("GROQ_API_KEY"):
-    st.info("👈  Enter your **Groq API Key** in the sidebar to start.")
-    st.stop()
-
-chain, load_error = get_pipeline()
-if load_error:
-    st.error(f"Pipeline load failed: {load_error}")
-    st.stop()
-
-
-# ── EXAMPLE CASES ─────────────────────────────────────────────────────────────
-EXAMPLES = {
-    "Self-Defence (BNS 34 / IPC 99)": (
-        "My client, a 34-year-old shopkeeper, was closing his shop at night when the complainant "
-        "and two accomplices attacked him with iron rods. In the struggle, my client grabbed a nearby "
-        "wooden plank and struck one of them on the head, causing grievous hurt. Police charged him "
-        "under BNS Section 117 arguing disproportionate force. He claims pure self-defence."
-    ),
-    "Unlawful Assembly (BNS 189)": (
-        "My clients are five farmers who gathered at the district collector's office to protest land "
-        "acquisition. Police dispersed them and all five were arrested under BNS Section 189 (unlawful "
-        "assembly) and BNS Section 193 (rioting). The protest was peaceful; no property was damaged. "
-        "Build the strongest defence challenging the unlawful assembly charge."
-    ),
-    "Criminal Breach of Trust (BNS 316)": (
-        "My client was a finance manager entrusted with client deposits worth ₹2.4 crore. The company "
-        "collapsed and clients filed BNS Section 316 (criminal breach of trust) against him personally. "
-        "He had no independent authority over funds, followed board directions, and was himself "
-        "defrauded by the promoters. The FIR does not allege personal enrichment."
-    ),
-}
-
-
-# ── INPUT AREA ────────────────────────────────────────────────────────────────
-col1, col2 = st.columns([2, 1])
-
-with col2:
-    st.subheader("📋 Example Cases")
-    example_choice = st.selectbox("Load example:", ["— custom —"] + list(EXAMPLES.keys()))
-
-with col1:
-    st.subheader("📝 Case Facts")
-    default_text = EXAMPLES.get(example_choice, "") if example_choice != "— custom —" else ""
-    case_facts   = st.text_area(
-        "Describe the FIR, charges, and your client's position:",
-        value  = default_text,
-        height = 250,
-        placeholder = (
-            "e.g. My client is charged under BNS Section ___ for ___. "
-            "The facts are: … The defence is: …"
-        ),
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — FILE UPLOADER
+# Upload your 3 pre-built pipeline outputs once; they get saved to DBFS/OUT_DIR.
+# After uploading, switch to the Query tab.
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_upload:
+    st.subheader("📂 Upload Pre-built Pipeline Files")
+    st.info(
+        "You've already generated the 3 output files locally. "
+        "Upload them here once and the app will save them to DBFS so you never need to re-run the pipeline."
     )
 
-st.divider()
+    col_a, col_b = st.columns(2)
 
-run_btn = st.button("⚖️  Generate Legal Defence", type="primary", use_container_width=True)
+    with col_a:
+        st.markdown("**Required files**")
+        st.markdown("""
+| File | Generated by |
+|------|-------------|
+| `faiss_precedents.index` | `02_build_faiss.py` |
+| `faiss_metadata.parquet` | `02_build_faiss.py` |
+| `bns_ipc_mapping.csv` | `03_build_bns_ipc_map.py` |
+""")
+        st.markdown(f"**Destination:** `{OUT_DIR}`")
+
+    with col_b:
+        st.markdown("**Current status**")
+        for label, path in EXPECTED_FILES.items():
+            if os.path.exists(path):
+                mb = os.path.getsize(path) / 1e6
+                st.success(f"✅ {label} — {mb:.0f} MB (already on DBFS)")
+            else:
+                st.error(f"❌ {label} — missing")
+
+    st.divider()
+
+    uploaded_index   = st.file_uploader("1. FAISS Index file  (`faiss_precedents.index`)",  type=["index"],   key="u_index")
+    uploaded_meta    = st.file_uploader("2. Metadata parquet  (`faiss_metadata.parquet`)",   type=["parquet"], key="u_meta")
+    uploaded_bns_csv = st.file_uploader("3. BNS-IPC CSV       (`bns_ipc_mapping.csv`)",      type=["csv"],     key="u_csv")
+
+    if st.button("💾  Save to DBFS", type="primary", use_container_width=True):
+        uploads = [
+            (uploaded_index,   FAISS_INDEX_PATH, "FAISS Index"),
+            (uploaded_meta,    FAISS_META_PATH,  "Metadata parquet"),
+            (uploaded_bns_csv, BNS_CSV_PATH,     "BNS-IPC CSV"),
+        ]
+        any_uploaded = False
+        os.makedirs(OUT_DIR, exist_ok=True)
+
+        for file_obj, dest_path, label in uploads:
+            if file_obj is not None:
+                # Write via a temp file to avoid partial writes
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    tmp.write(file_obj.read())
+                    tmp_path = tmp.name
+                shutil.move(tmp_path, dest_path)
+                mb = os.path.getsize(dest_path) / 1e6
+                st.success(f"✅  {label} saved → `{dest_path}` ({mb:.1f} MB)")
+                any_uploaded = True
+            else:
+                if not os.path.exists(dest_path):
+                    st.warning(f"⚠️  {label}: no file selected and not already on DBFS.")
+
+        if any_uploaded:
+            # Clear the cached pipeline so it reloads with the new files
+            st.cache_resource.clear()
+            st.success("🎉 Files saved! Switch to the **Query** tab to start using the app.")
+        else:
+            st.warning("No new files were uploaded.")
 
 
-# ── RUN PIPELINE ──────────────────────────────────────────────────────────────
-if run_btn:
-    if not case_facts.strip():
-        st.warning("Please enter case facts before running.")
-    else:
-        with st.spinner("🔍 Retrieving precedents & drafting defence… (~15–30s on first query)"):
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — QUERY
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_query:
+
+    # ── Guard: files must exist ───────────────────────────────────────────────
+    if not all_present:
+        missing_names = [
+            label for label, path in EXPECTED_FILES.items()
+            if not os.path.exists(path)
+        ]
+        st.warning(
+            "⚠️  Some required files are missing:\n\n"
+            + "\n".join(f"- **{n}**" for n in missing_names)
+            + "\n\nGo to the **Upload Pre-built Files** tab and upload them."
+        )
+        st.stop()
+
+    # ── Guard: API key ────────────────────────────────────────────────────────
+    if not os.environ.get("GROQ_API_KEY"):
+        st.info("👈  Enter your **Groq API Key** in the sidebar to continue.")
+        st.stop()
+
+    # ── Load pipeline (cached — only runs once per Databricks App instance) ───
+    @st.cache_resource(
+        show_spinner="⏳ Loading pipeline — MiniLM + FAISS (first load ~90s on CPU)…"
+    )
+    def get_pipeline(index_path, meta_path, bns_path):
+        """
+        Cache key includes all three paths so the cache auto-invalidates
+        if you upload new files and they land at a different path.
+        """
+        from scripts.langchain_pipeline import (
+            load_pipeline_artifacts,
+            load_embedder,
+            build_chain,
+        )
+        fi, dm, db = load_pipeline_artifacts(index_path, meta_path, bns_path)
+        emb        = load_embedder(device="cpu")
+        chain      = build_chain(fi, dm, db, emb)
+        return chain
+
+    try:
+        chain = get_pipeline(FAISS_INDEX_PATH, FAISS_META_PATH, BNS_CSV_PATH)
+    except Exception as e:
+        st.error(f"**Pipeline load failed:** {e}")
+        st.caption("Check that GROQ_API_KEY is correct and all 3 files are valid.")
+        st.stop()
+
+    # ── Example cases ─────────────────────────────────────────────────────────
+    EXAMPLES = {
+        "— enter your own case —": "",
+        "Self-Defence (BNS 34 / IPC 99)": (
+            "My client, a 34-year-old shopkeeper, was closing his shop at night when the complainant "
+            "and two accomplices attacked him with iron rods. In the struggle, my client grabbed a nearby "
+            "wooden plank and struck one of them on the head, causing grievous hurt. Police charged him "
+            "under BNS Section 117 arguing disproportionate force. He claims pure self-defence."
+        ),
+        "Unlawful Assembly (BNS 189 / IPC 150)": (
+            "My clients are five farmers who gathered at the district collector's office to protest land "
+            "acquisition. Police dispersed them and all five were arrested under BNS Section 189 "
+            "(unlawful assembly) and BNS Section 193 (rioting). The protest was entirely peaceful; "
+            "no property was damaged. No common object to commit an offence existed."
+        ),
+        "Criminal Breach of Trust (BNS 316 / IPC 405)": (
+            "My client was a finance manager entrusted with client deposits worth ₹2.4 crore. The company "
+            "collapsed and clients filed BNS Section 316 (criminal breach of trust) against him personally. "
+            "He had no independent authority over funds, followed board directions, and was himself "
+            "defrauded by the promoters. The FIR does not allege personal enrichment."
+        ),
+        "Marital Separation & Consent (BNS 67 / IPC 376C)": (
+            "My client is charged under BNS Section 67 for alleged non-consensual relations with his "
+            "wife, from whom he is judicially separated. The couple had a decree of separation for "
+            "8 months at the time of the alleged incident. An ongoing divorce and property dispute "
+            "exists. What defences are available?"
+        ),
+    }
+
+    # ── Input area ────────────────────────────────────────────────────────────
+    left, right = st.columns([2, 1])
+
+    with right:
+        st.subheader("📋 Quick Examples")
+        example_choice = st.selectbox(
+            "Load a template case:",
+            list(EXAMPLES.keys()),
+            label_visibility="collapsed",
+        )
+        if example_choice != "— enter your own case —":
+            st.caption("Text loaded below — edit freely before running.")
+
+    with left:
+        st.subheader("📝 Case Facts")
+        prefill = EXAMPLES.get(example_choice, "")
+        case_facts = st.text_area(
+            "Describe the FIR, BNS charges, and your client's position:",
+            value=prefill,
+            height=260,
+            placeholder=(
+                "e.g. My client is charged under BNS Section ___ for ___.\n"
+                "The facts are: …\n"
+                "His defence is: …"
+            ),
+            label_visibility="collapsed",
+        )
+
+    st.divider()
+    run_btn = st.button(
+        "⚖️  Generate Legal Defence",
+        type="primary",
+        use_container_width=True,
+        disabled=not case_facts.strip(),
+    )
+
+    # ── Run ───────────────────────────────────────────────────────────────────
+    if run_btn and case_facts.strip():
+        with st.spinner("🔍 Retrieving precedents & drafting defence… (15–30 s)"):
             try:
                 response = chain.invoke(case_facts.strip())
             except Exception as e:
-                st.error(f"Pipeline error: {e}")
+                st.error(f"Query failed: {e}")
                 st.stop()
 
         st.divider()
         st.subheader("⚖️ Nyaya-Setu Legal Analysis")
 
-        # Render each section as an expander for readability
-        sections = {
-            "I. CHARGE & STATUTORY FRAMEWORK":           "📜",
-            "II. GOVERNING PRINCIPLES FROM PRECEDENT":   "📚",
-            "III. DEFENCE STRATEGY":                     "🛡️",
-            "IV. ANTICIPATED PROSECUTION ARGUMENTS":     "⚔️",
-            "V. TACTICAL SUMMARY":                       "🎯",
-        }
+        # Parse the 5 structured sections and display each in an expander
+        SECTIONS = [
+            ("I. CHARGE & STATUTORY FRAMEWORK",          "📜"),
+            ("II. GOVERNING PRINCIPLES FROM PRECEDENT",  "📚"),
+            ("III. DEFENCE STRATEGY",                    "🛡️"),
+            ("IV. ANTICIPATED PROSECUTION ARGUMENTS",    "⚔️"),
+            ("V. TACTICAL SUMMARY",                      "🎯"),
+        ]
 
-        # Try structured display; fall back to plain markdown
         found_any = False
-        remaining = response
-
-        import re
-        for heading, icon in sections.items():
+        for i, (heading, icon) in enumerate(SECTIONS):
+            # Build a regex that captures from this heading to the next (or end)
+            next_heading = SECTIONS[i + 1][0] if i + 1 < len(SECTIONS) else None
+            lookahead    = (
+                rf'(?=\*\*{re.escape(next_heading)})'
+                if next_heading
+                else r'$'
+            )
             pattern = re.compile(
-                rf'\*\*{re.escape(heading)}[^*]*\*\*(.*?)(?=\*\*[IVX]+\.|$)',
-                re.DOTALL | re.IGNORECASE
+                rf'\*\*{re.escape(heading)}[^*]*\*\*(.*?){lookahead}',
+                re.DOTALL | re.IGNORECASE,
             )
             m = pattern.search(response)
             if m:
                 found_any = True
                 content   = m.group(1).strip()
-                with st.expander(f"{icon} {heading}", expanded=True):
+                # Tactical summary stays expanded and styled prominently
+                expanded  = True
+                with st.expander(f"{icon}  {heading}", expanded=expanded):
                     st.markdown(content)
 
         if not found_any:
-            # Fallback: raw markdown
+            # LLM didn't use the expected headings — show raw output
             st.markdown(response)
 
-        # Download button
         st.divider()
         st.download_button(
-            label    = "📥  Download Full Analysis (.txt)",
-            data     = response,
-            file_name= "nyaya_setu_analysis.txt",
-            mime     = "text/plain",
+            label    ="📥  Download Full Analysis (.txt)",
+            data     =response,
+            file_name="nyaya_setu_analysis.txt",
+            mime     ="text/plain",
         )
-
 
 # ── FOOTER ────────────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
     "⚠️  Nyaya-Setu is an AI research tool for legal professionals. "
     "It does not constitute legal advice. Always verify citations independently. "
-    "Low-confidence BNS↔IPC mappings (< 60%) must be cross-checked with official gazette."
+    "Mappings with Confidence < 60% must be cross-checked with the official gazette."
 )
