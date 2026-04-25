@@ -1,0 +1,42 @@
+# requirements.txt
+# =================
+# Nyaya-Setu — Databricks Apps (CPU-only, no venv module)
+#
+# Install order matters for Databricks: pip installs these in sequence.
+# All packages are CPU-compatible and work on the ~15GB RAM Databricks Free tier.
+#
+# ⚠️  Do NOT add torch with CUDA — Databricks Free has no GPU.
+#     PyTorch CPU is pulled in automatically by sentence-transformers.
+# ⚠️  Do NOT add faiss-gpu — use faiss-cpu only.
+# ⚠️  Do NOT pin torch to a specific CUDA build string.
+
+# ── PDF Processing ────────────────────────────────────────────────────────────
+pymupdf>=1.23.0          # fitz — fast, reliable PDF text extraction (primary)
+PyPDF2>=3.0.0            # fallback PDF reader for 03_build_bns_ipc_map.py
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+pandas>=2.0.0
+pyarrow>=14.0.0          # parquet read/write
+numpy>=1.26.0
+
+# ── ML / Embeddings (CPU-only) ────────────────────────────────────────────────
+sentence-transformers>=2.7.0   # pulls torch CPU automatically
+faiss-cpu>=1.8.0               # CPU FAISS — DO NOT use faiss-gpu here
+
+# ── NLP / Feature Engineering ────────────────────────────────────────────────
+scikit-learn>=1.4.0            # TF-IDF vectoriser in 03_build_bns_ipc_map.py
+
+# ── LangChain + Groq ─────────────────────────────────────────────────────────
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-groq>=0.2.0
+groq>=0.9.0                    # underlying Groq SDK
+
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Streamlit (Databricks App frontend) ──────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Progress bars ─────────────────────────────────────────────────────────────
+tqdm>=4.66.0

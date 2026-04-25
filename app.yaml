@@ -1,0 +1,49 @@
+# app.yaml
+# =========
+# Databricks Apps deployment manifest for Nyaya-Setu.
+# Place this file at the repo root alongside app.py.
+#
+# Documentation: https://docs.databricks.com/en/dev-tools/databricks-apps/index.html
+
+command:
+  - python
+  - -m
+  - streamlit
+  - run
+  - app.py
+  - --server.port=8501
+  - --server.address=0.0.0.0
+  - --server.headless=true
+  - --server.enableCORS=false
+  - --server.enableXsrfProtection=false
+
+env:
+  # ── Pipeline output location on DBFS ──────────────────────────────────────
+  # Change this to your Unity Catalog volume path if using UC:
+  # e.g. /Volumes/main/nyaya_setu/output
+  - name: OUT_DIR
+    value: /dbfs/FileStore/nyaya_setu/output
+
+  - name: INDEX_PATH
+    value: /dbfs/FileStore/nyaya_setu/output/faiss_precedents.index
+
+  - name: META_PATH
+    value: /dbfs/FileStore/nyaya_setu/output/faiss_metadata.parquet
+
+  - name: BNS_CSV
+    value: /dbfs/FileStore/nyaya_setu/output/bns_ipc_mapping.csv
+
+  # ── GROQ API KEY ──────────────────────────────────────────────────────────
+  # DO NOT hard-code the key here.
+  # Set it as a secret in Databricks Apps UI:
+  #   App → Edit → Environment Variables → Add Secret
+  # Then reference it like this:
+  - name: GROQ_API_KEY
+    valueFrom:
+      secretRef:
+        # Name this secret "groq-api-key" in Databricks Secrets
+        name: groq-api-key
+
+  # ── Streamlit tuning ──────────────────────────────────────────────────────
+  - name: STREAMLIT_SERVER_MAX_UPLOAD_SIZE
+    value: "50"
